@@ -1,0 +1,54 @@
+[package]
+name = "netmeter"
+version = "0.3.0"
+edition = "2021"
+description = "Windows Network Traffic Monitor: taskbar traffic widget, dashboard, system tray, security triage, CLI, and native Windows installer"
+
+[features]
+default = ["etw"]
+# Per-process byte counters via Microsoft-Windows-Kernel-Network ETW (requires Administrator at runtime)
+etw = ["dep:ferrisetw"]
+# Embed compiled netmeter.exe and netmeter-cli.exe inside netmeter-setup.exe
+embed-payload = []
+
+[[bin]]
+name = "netmeter"
+path = "src/main.rs"
+
+[[bin]]
+name = "netmeter-cli"
+path = "src/bin/netmeter-cli.rs"
+
+[[bin]]
+name = "netmeter-setup"
+path = "src/bin/netmeter-setup.rs"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
+ferrisetw = { version = "1.2", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tray-icon = "0.19"
+
+[dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
