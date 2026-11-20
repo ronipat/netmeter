@@ -623,6 +623,16 @@ pub fn start_monitor() -> MonitorHandle {
                 let tcp_stats = net::tcp_global_stats_v4();
                 seq_counter = seq_counter.wrapping_add(1);
 
+                #[cfg(feature = "etw")]
+                let live_etw_status = if let Some(ref s) = etw_session {
+                    let count = s.events_seen.load(Ordering::Relaxed);
+                    format!("Active ({count} network events captured)")
+                } else {
+                    etw_status.clone()
+                };
+                #[cfg(not(feature = "etw"))]
+                let live_etw_status = etw_status.clone();
+
                 let next_snap = MonitorSnapshot {
                     seq: seq_counter,
                     timestamp: Utc::now(),
@@ -641,7 +651,7 @@ pub fn start_monitor() -> MonitorHandle {
                     tcp_summary,
                     tcp_stats,
                     etw_active,
-                    etw_status: etw_status.clone(),
+                    etw_status: live_etw_status,
                     paused: false,
                 };
 
