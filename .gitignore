@@ -1,0 +1,23 @@
+# Cargo / Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Built Windows installer binaries (rebuild via build-installer.ps1)
+/dist/*.exe
+
+# Local exports and logs
+/exports/
+*.log
+*.etl
+*.pcap
+*.pcapng
+
+# OS and IDE files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.swp
+*.swo
