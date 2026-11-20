@@ -20,6 +20,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use netmeter::app_icon_data;
 use netmeter::export;
+use netmeter::i18n::{self, Language, Strings};
 use netmeter::install;
 use netmeter::monitor::{
     format_bytes, format_link_speed, format_rate, start_monitor, MonitorControl, MonitorHandle,
@@ -33,7 +34,7 @@ use netmeter::theme::{self, Palette, ThemeMode};
 const APP_TITLE: &str = "Net Meter";
 const HIDDEN_POS: [f32; 2] = [-10000.0, -10000.0];
 const HIDDEN_SIZE: [f32; 2] = [1.0, 1.0];
-const MENU_SIZE: [f32; 2] = [258.0, 274.0];
+const MENU_SIZE: [f32; 2] = [262.0, 316.0];
 const DASH_SIZE: [f32; 2] = [980.0, 660.0];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,7 @@ enum ViewMode {
 enum MenuAction {
     OpenMonitor,
     SetTheme(ThemeMode),
+    SetLanguage(Language),
     ToggleAutostart,
     ExitApp,
 }
@@ -150,10 +152,10 @@ fn render_tray_icon_levels(rx_h: usize, tx_h: usize, paused: bool, has_alert: bo
     Icon::from_rgba(rgba, W as u32, H as u32).expect("valid 32x32 icon")
 }
 
-fn build_tray() -> Result<TrayIcon, String> {
+fn build_tray(initial_lang: Language) -> Result<TrayIcon, String> {
     let icon = render_tray_icon_levels(3, 3, false, false);
     TrayIconBuilder::new()
-        .with_tooltip("NetMeter — Click for menu")
+        .with_tooltip(i18n::strings(initial_lang).tray_tip_click)
         .with_icon(icon)
         .build()
         .map_err(|e| format!("{e}"))
@@ -164,6 +166,7 @@ struct TrayRuntime {
     tray_rx: mpsc::Receiver<TrayIconEvent>,
     stop: Arc<AtomicBool>,
     done: Arc<AtomicBool>,
+    lang_is_id: Arc<AtomicBool>,
 }
 
 /// Spawn a dedicated Win32 thread for the System Tray icon so `Shell_NotifyIconW` calls
@@ -171,13 +174,16 @@ struct TrayRuntime {
 fn start_tray_worker(
     snapshot: Arc<Mutex<MonitorSnapshot>>,
     wake_ctx: egui::Context,
+    initial_lang: Language,
 ) -> TrayRuntime {
     let (ready_tx, ready_rx) = mpsc::sync_channel::<bool>(1);
     let (event_tx, event_rx) = mpsc::channel::<TrayIconEvent>();
     let stop = Arc::new(AtomicBool::new(false));
     let done = Arc::new(AtomicBool::new(false));
+    let lang_is_id = Arc::new(AtomicBool::new(initial_lang.is_id()));
     let stop_bg = Arc::clone(&stop);
     let done_bg = Arc::clone(&done);
+    let lang_bg = Arc::clone(&lang_is_id);
 
     TrayIconEvent::set_event_handler(Some(move |event| {
         let should_wake = matches!(
@@ -200,7 +206,7 @@ fn start_tray_worker(
     let _ = thread::Builder::new()
         .name("netmeter-tray".into())
         .spawn(move || {
-            let tray = match build_tray() {
+            let tray = match build_tray(initial_lang) {
                 Ok(t) => {
                     let _ = ready_tx.send(true);
                     t
@@ -241,20 +247,33 @@ fn start_tray_worker(
                         let has_alert = guard.alert_count > 0;
                         let key = (rx_h, tx_h, guard.paused, has_alert);
 
+                        let cur_lang = if lang_bg.load(Ordering::Relaxed) {
+                            Language::Id
+                        } else {
+                            Language::En
+                        };
+                        let tr = i18n::strings(cur_lang);
+
                         let tip = if guard.paused {
-                            "NetMeter (Paused)".to_string()
+                            tr.tray_tip_paused.to_string()
                         } else if has_alert {
                             format!(
-                                "NetMeter | In {}  Out {} | {} alert(s)",
+                                "NetMeter | {} {}  {} {} | {} {}",
+                                if cur_lang.is_id() { "Masuk" } else { "In" },
                                 format_rate(guard.down_bps),
+                                if cur_lang.is_id() { "Keluar" } else { "Out" },
                                 format_rate(guard.up_bps),
-                                guard.alert_count
+                                guard.alert_count,
+                                tr.tray_tip_alerts
                             )
                         } else {
                             format!(
-                                "NetMeter | In {}  Out {} | Session {} / {}",
+                                "NetMeter | {} {}  {} {} | {} {} / {}",
+                                if cur_lang.is_id() { "Masuk" } else { "In" },
                                 format_rate(guard.down_bps),
+                                if cur_lang.is_id() { "Keluar" } else { "Out" },
                                 format_rate(guard.up_bps),
+                                tr.tray_session,
                                 format_bytes(guard.session_rx_bytes),
                                 format_bytes(guard.session_tx_bytes)
                             )
@@ -321,6 +340,7 @@ fn start_tray_worker(
         tray_rx: event_rx,
         stop,
         done,
+        lang_is_id,
     }
 }
 
@@ -442,9 +462,11 @@ struct NetMeterApp {
     tray_rx: mpsc::Receiver<TrayIconEvent>,
     tray_stop: Arc<AtomicBool>,
     tray_done: Arc<AtomicBool>,
+    tray_lang_is_id: Arc<AtomicBool>,
     mode: ViewMode,
     tab: DashTab,
     theme_mode: ThemeMode,
+    language: Language,
     autostart_enabled: bool,
     menu_opened_at: Instant,
     menu_saw_focus: bool,
@@ -463,7 +485,12 @@ struct NetMeterApp {
 }
 
 impl NetMeterApp {
-    fn new(handle: MonitorHandle, tray: TrayRuntime, theme_mode: ThemeMode) -> Self {
+    fn new(
+        handle: MonitorHandle,
+        tray: TrayRuntime,
+        theme_mode: ThemeMode,
+        language: Language,
+    ) -> Self {
         let initial_mode = if tray.has_tray {
             ViewMode::TrayHidden
         } else {
@@ -481,9 +508,11 @@ impl NetMeterApp {
             tray_rx: tray.tray_rx,
             tray_stop: tray.stop,
             tray_done: tray.done,
+            tray_lang_is_id: tray.lang_is_id,
             mode: initial_mode,
             tab: DashTab::Overview,
             theme_mode,
+            language,
             autostart_enabled: install::is_autostart_enabled(),
             menu_opened_at: Instant::now(),
             menu_saw_focus: false,
@@ -506,6 +535,19 @@ impl NetMeterApp {
         theme::palette(self.theme_mode)
     }
 
+    fn tr(&self) -> &'static Strings {
+        i18n::strings(self.language)
+    }
+
+    fn theme_name(&self, mode: ThemeMode) -> &'static str {
+        let tr = self.tr();
+        match mode {
+            ThemeMode::Dark => tr.theme_dark,
+            ThemeMode::Light => tr.theme_white,
+            ThemeMode::Cartoon => tr.theme_cartoon,
+        }
+    }
+
     fn set_theme(&mut self, ctx: &egui::Context, mode: ThemeMode) {
         if self.theme_mode == mode {
             return;
@@ -513,6 +555,15 @@ impl NetMeterApp {
         self.theme_mode = mode;
         theme::apply_theme(ctx, self.theme_mode);
         install::save_theme_pref(self.theme_mode.as_pref());
+    }
+
+    fn set_language(&mut self, lang: Language) {
+        if self.language == lang {
+            return;
+        }
+        self.language = lang;
+        self.tray_lang_is_id.store(lang.is_id(), Ordering::Relaxed);
+        install::save_language_pref(lang.as_pref());
     }
 
     fn control(&self) -> &Arc<MonitorControl> {
@@ -611,18 +662,19 @@ impl NetMeterApp {
     }
 
     fn toggle_autostart(&mut self) {
+        let tr = self.tr();
         let next = !self.autostart_enabled;
         let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("netmeter.exe"));
         match install::set_autostart(next, &exe) {
             Ok(()) => {
                 self.autostart_enabled = next;
                 self.set_banner(if next {
-                    "Enabled Start with Windows".into()
+                    tr.banner_autostart_on.into()
                 } else {
-                    "Disabled Start with Windows".into()
+                    tr.banner_autostart_off.into()
                 });
             }
-            Err(e) => self.set_banner(format!("Auto-start update failed: {e}")),
+            Err(e) => self.set_banner(format!("{}: {e}", tr.banner_autostart_err)),
         }
     }
 
@@ -631,26 +683,28 @@ impl NetMeterApp {
     }
 
     fn do_export_json(&mut self, snap: &MonitorSnapshot) {
+        let tr = self.tr();
         let name = format!(
             "netmeter-snapshot-{}.json",
             Local::now().format("%Y%m%d-%H%M%S")
         );
         let path = default_export_dir().join(name);
         match export::export_json(snap, &path) {
-            Ok(()) => self.set_banner(format!("Saved JSON snapshot to {}", path.display())),
-            Err(e) => self.set_banner(format!("Export failed: {e}")),
+            Ok(()) => self.set_banner(format!("{} {}", tr.banner_saved_json, path.display())),
+            Err(e) => self.set_banner(format!("{}: {e}", tr.banner_export_err)),
         }
     }
 
     fn do_export_csv(&mut self, snap: &MonitorSnapshot) {
+        let tr = self.tr();
         let name = format!(
             "netmeter-connections-{}.csv",
             Local::now().format("%Y%m%d-%H%M%S")
         );
         let path = default_export_dir().join(name);
         match export::export_connections_csv(snap, &path) {
-            Ok(()) => self.set_banner(format!("Saved CSV connections to {}", path.display())),
-            Err(e) => self.set_banner(format!("Export failed: {e}")),
+            Ok(()) => self.set_banner(format!("{} {}", tr.banner_saved_csv, path.display())),
+            Err(e) => self.set_banner(format!("{}: {e}", tr.banner_export_err)),
         }
     }
 
@@ -773,7 +827,7 @@ impl NetMeterApp {
             painter.text(
                 Pos2::new(rect.left() + 10.0, rect.top() + 7.0),
                 egui::Align2::LEFT_TOP,
-                format!("Scale max: {}", format_rate(max_rate)),
+                format!("{} {}", self.tr().scale_max, format_rate(max_rate)),
                 egui::FontId::monospace(10.5),
                 pal.text_muted,
             );
@@ -995,6 +1049,7 @@ impl NetMeterApp {
         }
 
         let pal = self.pal();
+        let tr = self.tr();
         let mut pending_action: Option<MenuAction> = None;
         let autostart_enabled = self.autostart_enabled;
 
@@ -1023,11 +1078,11 @@ impl NetMeterApp {
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let (lbl, col) = if is_paused {
-                            ("Paused", pal.text_muted)
+                            (tr.tray_status_paused, pal.text_muted)
                         } else if snap.alert_count > 0 {
-                            ("Alert", pal.amber)
+                            (tr.tray_status_alert, pal.amber)
                         } else {
-                            ("Live", pal.emerald)
+                            (tr.tray_status_live, pal.emerald)
                         };
                         theme::status_pill_with(ui, lbl, col, pal.surface, pal);
                     });
@@ -1042,10 +1097,10 @@ impl NetMeterApp {
                         ui.set_width(ui.available_width());
                         ui.columns(2, |cols| {
                             cols[0].vertical(|ui| {
-                                ui.label(RichText::new("IN (RX)").color(pal.text_muted).size(9.5).strong());
+                                ui.label(RichText::new(tr.tray_in_label).color(pal.text_muted).size(9.5).strong());
                                 ui.label(
                                     RichText::new(if is_paused {
-                                        "PAUSED".to_string()
+                                        tr.tray_paused_val.to_string()
                                     } else {
                                         format_rate(snap.down_bps)
                                     })
@@ -1056,10 +1111,10 @@ impl NetMeterApp {
                                 );
                             });
                             cols[1].vertical(|ui| {
-                                ui.label(RichText::new("OUT (TX)").color(pal.text_muted).size(9.5).strong());
+                                ui.label(RichText::new(tr.tray_out_label).color(pal.text_muted).size(9.5).strong());
                                 ui.label(
                                     RichText::new(if is_paused {
-                                        "PAUSED".to_string()
+                                        tr.tray_paused_val.to_string()
                                     } else {
                                         format_rate(snap.up_bps)
                                     })
@@ -1085,7 +1140,8 @@ impl NetMeterApp {
                         ui.horizontal(|ui| {
                             ui.label(
                                 RichText::new(format!(
-                                    "Session: {} / {}",
+                                    "{}: {} / {}",
+                                    tr.tray_session,
                                     format_bytes(snap.session_rx_bytes),
                                     format_bytes(snap.session_tx_bytes)
                                 ))
@@ -1096,9 +1152,12 @@ impl NetMeterApp {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     ui.label(
-                                        RichText::new(format!("{} Estab", snap.tcp_summary.established))
-                                            .color(pal.text_subtle)
-                                            .size(10.0),
+                                        RichText::new(format!(
+                                            "{} {}",
+                                            snap.tcp_summary.established, tr.tray_estab
+                                        ))
+                                        .color(pal.text_subtle)
+                                        .size(10.0),
                                     );
                                 },
                             );
@@ -1109,7 +1168,7 @@ impl NetMeterApp {
                     ui,
                     pal,
                     MenuIconKind::Monitor,
-                    "Open Full Monitor",
+                    tr.tray_open_monitor,
                     Some((">", pal.accent)),
                     None,
                 ) {
@@ -1124,13 +1183,13 @@ impl NetMeterApp {
                     .inner_margin(egui::Margin::symmetric(7.0, 4.0))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(RichText::new("Theme").color(pal.text_muted).size(10.0).strong());
+                        ui.label(RichText::new(tr.tray_theme).color(pal.text_muted).size(10.0).strong());
                         ui.add_space(2.0);
                         ui.columns(3, |cols| {
                             for (idx, (mode, lbl)) in [
-                                (ThemeMode::Dark, "Dark"),
-                                (ThemeMode::Light, "White"),
-                                (ThemeMode::Cartoon, "Cartoon"),
+                                (ThemeMode::Dark, tr.theme_dark),
+                                (ThemeMode::Light, tr.theme_white),
+                                (ThemeMode::Cartoon, tr.theme_cartoon),
                             ]
                             .into_iter()
                             .enumerate()
@@ -1155,13 +1214,61 @@ impl NetMeterApp {
                         });
                     });
 
+                // 2-option Language selector inside Tray menu (English / Indonesia)
+                egui::Frame::none()
+                    .fill(pal.surface)
+                    .stroke(Stroke::new(1.0_f32, pal.border_subtle))
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::symmetric(7.0, 4.0))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(tr.tray_language)
+                                    .color(pal.text_muted)
+                                    .size(10.0)
+                                    .strong(),
+                            );
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    for (lang, lbl) in [
+                                        (Language::Id, "Indonesia"),
+                                        (Language::En, "English"),
+                                    ] {
+                                        let active = self.language == lang;
+                                        let btn = egui::Button::new(
+                                            RichText::new(lbl)
+                                                .color(if active {
+                                                    pal.text_main
+                                                } else {
+                                                    pal.text_muted
+                                                })
+                                                .size(10.5)
+                                                .strong(),
+                                        )
+                                        .fill(if active { pal.surface_2 } else { pal.bg_alt })
+                                        .stroke(Stroke::new(
+                                            1.0_f32,
+                                            if active { pal.border } else { pal.border_subtle },
+                                        ))
+                                        .rounding(6.0);
+                                        if ui.add_sized([74.0, 20.0], btn).clicked() {
+                                            pending_action = Some(MenuAction::SetLanguage(lang));
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                    });
+
                 if draw_9router_menu_row(
                     ui,
                     pal,
                     MenuIconKind::Startup(autostart_enabled),
-                    "Start with Windows",
+                    tr.tray_start_with_windows,
                     Some((
-                        if autostart_enabled { "On" } else { "Off" },
+                        if autostart_enabled { tr.tray_on } else { tr.tray_off },
                         if autostart_enabled { pal.emerald } else { pal.text_subtle },
                     )),
                     None,
@@ -1184,7 +1291,7 @@ impl NetMeterApp {
                     ui,
                     pal,
                     MenuIconKind::Exit,
-                    "Quit",
+                    tr.tray_quit,
                     None,
                     Some(pal.danger),
                 ) {
@@ -1196,6 +1303,7 @@ impl NetMeterApp {
             match action {
                 MenuAction::OpenMonitor => self.open_dashboard(ctx),
                 MenuAction::SetTheme(mode) => self.set_theme(ctx, mode),
+                MenuAction::SetLanguage(lang) => self.set_language(lang),
                 MenuAction::ToggleAutostart => self.toggle_autostart(),
                 MenuAction::ExitApp => self.exit_app(ctx),
             }
@@ -1204,7 +1312,9 @@ impl NetMeterApp {
 
     fn render_dashboard(&mut self, ctx: &egui::Context, snap: &MonitorSnapshot) {
         let pal = self.pal();
+        let tr = self.tr();
         let mut requested_theme: Option<ThemeMode> = None;
+        let mut requested_lang: Option<Language> = None;
         let is_paused = self.control().is_paused();
         let is_fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
 
@@ -1247,7 +1357,7 @@ impl NetMeterApp {
                                         .strong(),
                                 );
                                 ui.label(
-                                    RichText::new("Smart Windows Traffic & Socket Monitor")
+                                    RichText::new(tr.app_subtitle)
                                         .color(pal.text_muted)
                                         .size(11.0),
                                 );
@@ -1257,7 +1367,7 @@ impl NetMeterApp {
                             if snap.etw_active {
                                 theme::status_pill_with(
                                     ui,
-                                    "ETW Active",
+                                    tr.etw_active,
                                     pal.emerald,
                                     pal.bg_alt,
                                     pal,
@@ -1265,7 +1375,7 @@ impl NetMeterApp {
                             } else {
                                 theme::status_pill_with(
                                     ui,
-                                    "Standard Mode",
+                                    tr.etw_standard,
                                     pal.amber,
                                     pal.bg_alt,
                                     pal,
@@ -1276,15 +1386,15 @@ impl NetMeterApp {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     let exit_btn = egui::Button::new(
-                                        RichText::new("Exit").color(pal.text_main).strong(),
+                                        RichText::new(tr.btn_exit).color(pal.text_main).strong(),
                                     )
                                     .fill(pal.bg_alt)
                                     .stroke(Stroke::new(1.0_f32, pal.border))
                                     .rounding(7.0);
                                     let exit_tip = if self.has_tray {
-                                        "Hide window to Windows system tray (use Quit in tray menu to exit)"
+                                        tr.tip_hide_to_tray
                                     } else {
-                                        "Exit Net Meter"
+                                        tr.tip_exit_app
                                     };
                                     if ui
                                         .add(exit_btn)
@@ -1298,7 +1408,7 @@ impl NetMeterApp {
                                         }
                                     }
 
-                                    let pause_lbl = if is_paused { "Start" } else { "Pause" };
+                                    let pause_lbl = if is_paused { tr.btn_start } else { tr.btn_pause };
                                     let pause_btn = egui::Button::new(
                                         RichText::new(pause_lbl)
                                             .color(if is_paused {
@@ -1319,8 +1429,9 @@ impl NetMeterApp {
 
                                     // Explicit 1px-bordered Auto-start toggle chip with clear checkmark
                                     let checked = self.autostart_enabled;
+                                    let chip_w = if self.language.is_id() { 126.0 } else { 104.0 };
                                     let (auto_rect, auto_resp) = ui.allocate_exact_size(
-                                        Vec2::new(104.0, 26.0),
+                                        Vec2::new(chip_w, 26.0),
                                         egui::Sense::click(),
                                     );
                                     let bg = if auto_resp.hovered() {
@@ -1377,12 +1488,12 @@ impl NetMeterApp {
                                     ui.painter().text(
                                         Pos2::new(auto_rect.left() + 26.0, auto_rect.center().y),
                                         egui::Align2::LEFT_CENTER,
-                                        "Auto-start",
+                                        tr.lbl_autostart,
                                         egui::FontId::proportional(12.5),
                                         pal.text_main,
                                     );
                                     if auto_resp
-                                        .on_hover_text("Start Net Meter automatically with Windows")
+                                        .on_hover_text(tr.tip_autostart)
                                         .clicked()
                                     {
                                         self.toggle_autostart();
@@ -1411,18 +1522,22 @@ impl NetMeterApp {
                             ui.set_min_width(nav_avail_w);
                             ui.horizontal(|ui| {
                                 let tabs = [
-                                    (DashTab::Overview, "Overview".to_string()),
+                                    (DashTab::Overview, tr.tab_overview.to_string()),
                                     (
                                         DashTab::Processes,
-                                        format!("Processes ({})", snap.processes.len()),
+                                        format!("{} ({})", tr.tab_processes, snap.processes.len()),
                                     ),
                                     (
                                         DashTab::Connections,
-                                        format!("Connections ({})", snap.connections.len()),
+                                        format!(
+                                            "{} ({})",
+                                            tr.tab_connections,
+                                            snap.connections.len()
+                                        ),
                                     ),
                                     (
                                         DashTab::Adapters,
-                                        format!("Adapters & Diagnostics ({})", snap.adapters.len()),
+                                        format!("{} ({})", tr.tab_adapters, snap.adapters.len()),
                                     ),
                                 ];
                                 for (t, label) in tabs {
@@ -1455,41 +1570,69 @@ impl NetMeterApp {
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
+                                        // Language dropdown selector (English / Indonesia)
+                                        let mut chosen_lang = self.language;
+                                        egui::ComboBox::from_id_salt("app_lang_select")
+                                            .selected_text(self.language.label())
+                                            .width(86.0)
+                                            .show_ui(ui, |ui| {
+                                                ui.selectable_value(
+                                                    &mut chosen_lang,
+                                                    Language::En,
+                                                    "English",
+                                                );
+                                                ui.selectable_value(
+                                                    &mut chosen_lang,
+                                                    Language::Id,
+                                                    "Indonesia",
+                                                );
+                                            });
+                                        if chosen_lang != self.language {
+                                            requested_lang = Some(chosen_lang);
+                                        }
+                                        ui.label(
+                                            RichText::new(tr.lbl_language)
+                                                .color(pal.text_muted)
+                                                .small(),
+                                        );
+
+                                        ui.add_space(4.0);
+
                                         // Theme dropdown selector (Dark / White / Cartoon)
                                         let mut chosen_theme = self.theme_mode;
                                         egui::ComboBox::from_id_salt("app_theme_select")
-                                            .selected_text(self.theme_mode.label())
-                                            .width(88.0)
+                                            .selected_text(self.theme_name(self.theme_mode))
+                                            .width(84.0)
                                             .show_ui(ui, |ui| {
                                                 ui.selectable_value(
                                                     &mut chosen_theme,
                                                     ThemeMode::Dark,
-                                                    "Dark",
+                                                    tr.theme_dark,
                                                 );
                                                 ui.selectable_value(
                                                     &mut chosen_theme,
                                                     ThemeMode::Light,
-                                                    "White",
+                                                    tr.theme_white,
                                                 );
                                                 ui.selectable_value(
                                                     &mut chosen_theme,
                                                     ThemeMode::Cartoon,
-                                                    "Cartoon",
+                                                    tr.theme_cartoon,
                                                 );
                                             });
                                         if chosen_theme != self.theme_mode {
                                             requested_theme = Some(chosen_theme);
                                         }
                                         ui.label(
-                                            RichText::new("Theme:").color(pal.text_muted).small(),
+                                            RichText::new(tr.lbl_theme).color(pal.text_muted).small(),
                                         );
 
                                         if snap.alert_count > 0 {
                                             ui.separator();
                                             let alert_btn = egui::Button::new(
                                                 RichText::new(format!(
-                                                    "! {} Security Alert(s)",
-                                                    snap.alert_count
+                                                    "! {} {}",
+                                                    snap.alert_count, tr.security_alerts_btn
                                                 ))
                                                 .color(pal.amber)
                                                 .strong(),
@@ -1530,6 +1673,9 @@ impl NetMeterApp {
 
         if let Some(mode) = requested_theme {
             self.set_theme(ctx, mode);
+        }
+        if let Some(lang) = requested_lang {
+            self.set_language(lang);
         }
     }
 
@@ -1595,6 +1741,7 @@ impl NetMeterApp {
     }
 
     fn render_tab_overview(&mut self, ui: &mut egui::Ui, pal: Palette, snap: &MonitorSnapshot) {
+        let tr = self.tr();
         let avail_w = ui.available_width();
         let card_w = ((avail_w - 24.0) / 4.0).max(205.0);
         let is_paused = self.control().is_paused();
@@ -1616,11 +1763,13 @@ impl NetMeterApp {
                     Self::kpi_card(
                         ui,
                         pal,
-                        "In (Download)",
+                        tr.kpi_in,
                         &format_rate(disp_down),
                         &format!(
-                            "Peak {} | Session {}",
+                            "{} {} | {} {}",
+                            tr.lbl_peak,
                             format_rate(snap.peak_down_bps),
+                            tr.lbl_session,
                             format_bytes(snap.session_rx_bytes)
                         ),
                         "RX",
@@ -1630,11 +1779,13 @@ impl NetMeterApp {
                     Self::kpi_card(
                         ui,
                         pal,
-                        "Out (Upload)",
+                        tr.kpi_out,
                         &format_rate(disp_up),
                         &format!(
-                            "Peak {} | Session {}",
+                            "{} {} | {} {}",
+                            tr.lbl_peak,
                             format_rate(snap.peak_up_bps),
+                            tr.lbl_session,
                             format_bytes(snap.session_tx_bytes)
                         ),
                         "TX",
@@ -1644,10 +1795,11 @@ impl NetMeterApp {
                     Self::kpi_card(
                         ui,
                         pal,
-                        "Active Sockets",
-                        &format!("{} Estab", snap.tcp_summary.established),
+                        tr.kpi_sockets,
+                        &format!("{} {}", snap.tcp_summary.established, tr.lbl_estab),
                         &format!(
-                            "Listen {} | TW {} | UDP {}",
+                            "{} {} | TW {} | UDP {}",
+                            tr.lbl_listen,
                             snap.tcp_summary.listen,
                             snap.tcp_summary.time_wait,
                             snap.tcp_summary.udp_total
@@ -1659,14 +1811,18 @@ impl NetMeterApp {
                     Self::kpi_card(
                         ui,
                         pal,
-                        "Security Triage",
-                        &format!("{} Flagged", snap.alert_count),
+                        tr.kpi_security,
+                        &format!("{} {}", snap.alert_count, tr.lbl_flagged),
                         if snap.alert_count == 0 {
-                            "No LOLBin / risky ports"
+                            tr.sec_none
                         } else {
-                            "Click Alert pill to inspect"
+                            tr.sec_click_inspect
                         },
-                        if snap.alert_count > 0 { "ALERT" } else { "SAFE" },
+                        if snap.alert_count > 0 {
+                            tr.badge_alert
+                        } else {
+                            tr.badge_safe
+                        },
                         if snap.alert_count > 0 { pal.amber } else { pal.violet },
                         card_w,
                     );
@@ -1676,9 +1832,9 @@ impl NetMeterApp {
         ui.add_space(10.0);
 
         ui.horizontal(|ui| {
-            ui.label(RichText::new("Monitored interface:").color(pal.text_muted));
+            ui.label(RichText::new(tr.monitored_iface).color(pal.text_muted));
             let current_label = match snap.selected_adapter_luid {
-                None => "All Physical Up Adapters".to_string(),
+                None => tr.all_physical_up.to_string(),
                 Some(luid) => snap
                     .adapters
                     .iter()
@@ -1692,7 +1848,7 @@ impl NetMeterApp {
                 .show_ui(ui, |ui| {
                     let selected = snap.selected_adapter_luid;
                     if ui
-                        .selectable_label(selected.is_none(), "All Physical Up Adapters")
+                        .selectable_label(selected.is_none(), tr.all_physical_up)
                         .clicked()
                     {
                         self.control().set_selected_adapter(None);
@@ -1701,7 +1857,11 @@ impl NetMeterApp {
                         if !a.info.is_up {
                             continue;
                         }
-                        let tag = if a.info.is_hardware { "Physical" } else { "Virtual" };
+                        let tag = if a.info.is_hardware {
+                            tr.iface_physical
+                        } else {
+                            tr.iface_virtual
+                        };
                         let label = format!("[{tag}] {} — {}", a.info.alias, a.info.description);
                         if ui
                             .selectable_label(selected == Some(a.info.luid), label)
@@ -1718,9 +1878,9 @@ impl NetMeterApp {
                 } else {
                     pal.emerald
                 };
-                ui.label(RichText::new("Out (TX)").color(pal.sky).small().strong());
-                ui.label(RichText::new("In (RX)").color(in_leg_col).small().strong());
-                ui.label(RichText::new("120s Waveform:").color(pal.text_muted).small());
+                ui.label(RichText::new(tr.tray_out_label).color(pal.sky).small().strong());
+                ui.label(RichText::new(tr.tray_in_label).color(in_leg_col).small().strong());
+                ui.label(RichText::new(tr.waveform_120s).color(pal.text_muted).small());
             });
         });
 
@@ -1742,11 +1902,11 @@ impl NetMeterApp {
             .show(ui, |ui| {
                 ui.set_min_size(Vec2::new((full_w - 26.0).max(200.0), (full_h - 26.0).max(90.0)));
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Top Active Processes").color(pal.text_main).strong());
+                    ui.label(RichText::new(tr.top_active_procs).color(pal.text_main).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         theme::tag_badge(
                             ui,
-                            &format!("{} procs", snap.processes.len()),
+                            &format!("{} {}", snap.processes.len(), tr.procs_count),
                             pal.text_muted,
                             pal.border,
                             pal.bg_alt,
@@ -1772,14 +1932,14 @@ impl NetMeterApp {
                             .min_col_width(col_w)
                             .spacing([14.0, 5.0])
                             .show(ui, |ui| {
-                                ui.label(RichText::new("Process").color(pal.text_muted).strong());
-                                ui.label(RichText::new("PID").color(pal.text_muted).strong());
-                                ui.label(RichText::new("Established").color(pal.text_muted).strong());
-                                ui.label(RichText::new("Listening").color(pal.text_muted).strong());
-                                ui.label(RichText::new("UDP").color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_process).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_pid).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_established).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_listening).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_udp).color(pal.text_muted).strong());
                                 if snap.etw_active {
-                                    ui.label(RichText::new("In Rate").color(pal.emerald).strong());
-                                    ui.label(RichText::new("Out Rate").color(pal.sky).strong());
+                                    ui.label(RichText::new(tr.col_in_rate).color(pal.emerald).strong());
+                                    ui.label(RichText::new(tr.col_out_rate).color(pal.sky).strong());
                                 }
                                 ui.end_row();
 
@@ -1805,6 +1965,7 @@ impl NetMeterApp {
     }
 
     fn render_tab_processes(&mut self, ui: &mut egui::Ui, pal: Palette, snap: &MonitorSnapshot) {
+        let tr = self.tr();
         if !snap.etw_active {
             egui::Frame::none()
                 .fill(pal.bg_alt)
@@ -1813,13 +1974,7 @@ impl NetMeterApp {
                 .inner_margin(egui::Margin::same(8.0))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(
-                        RichText::new(
-                            "Per-process byte rates use ETW (Microsoft-Windows-Kernel-Network), which requires Administrator rights. Running unprivileged shows live socket counts and executable paths.",
-                        )
-                        .color(pal.amber)
-                        .small(),
-                    );
+                    ui.label(RichText::new(tr.etw_notice).color(pal.amber).small());
                 });
             ui.add_space(8.0);
         }
@@ -1832,26 +1987,38 @@ impl NetMeterApp {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Filter:").color(pal.text_muted));
+                    ui.label(RichText::new(tr.lbl_filter).color(pal.text_muted));
                     ui.text_edit_singleline(&mut self.search_query);
                     ui.add_space(12.0);
-                    ui.label(RichText::new("Sort:").color(pal.text_muted));
+                    ui.label(RichText::new(tr.lbl_sort).color(pal.text_muted));
                     egui::ComboBox::from_id_salt("proc_sort")
                         .selected_text(match self.process_sort {
-                            ProcessSort::TrafficOrSockets => "Activity",
-                            ProcessSort::Name => "Name",
-                            ProcessSort::Pid => "PID",
-                            ProcessSort::Alerts => "Alerts",
+                            ProcessSort::TrafficOrSockets => tr.sort_activity,
+                            ProcessSort::Name => tr.sort_name,
+                            ProcessSort::Pid => tr.sort_pid,
+                            ProcessSort::Alerts => tr.sort_alerts,
                         })
                         .show_ui(ui, |ui| {
                             ui.selectable_value(
                                 &mut self.process_sort,
                                 ProcessSort::TrafficOrSockets,
-                                "Activity",
+                                tr.sort_activity,
                             );
-                            ui.selectable_value(&mut self.process_sort, ProcessSort::Name, "Name");
-                            ui.selectable_value(&mut self.process_sort, ProcessSort::Pid, "PID");
-                            ui.selectable_value(&mut self.process_sort, ProcessSort::Alerts, "Alerts");
+                            ui.selectable_value(
+                                &mut self.process_sort,
+                                ProcessSort::Name,
+                                tr.sort_name,
+                            );
+                            ui.selectable_value(
+                                &mut self.process_sort,
+                                ProcessSort::Pid,
+                                tr.sort_pid,
+                            );
+                            ui.selectable_value(
+                                &mut self.process_sort,
+                                ProcessSort::Alerts,
+                                tr.sort_alerts,
+                            );
                         });
                 });
             });
@@ -1892,11 +2059,11 @@ impl NetMeterApp {
             .show(ui, |ui| {
                 ui.set_min_size(Vec2::new((full_w - 26.0).max(200.0), (full_h - 26.0).max(90.0)));
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Process Activity").color(pal.text_main).strong());
+                    ui.label(RichText::new(tr.proc_activity_title).color(pal.text_main).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         theme::tag_badge(
                             ui,
-                            &format!("{} visible", rows.len()),
+                            &format!("{} {}", rows.len(), tr.visible_count),
                             pal.text_muted,
                             pal.border,
                             pal.bg_alt,
@@ -1918,19 +2085,19 @@ impl NetMeterApp {
                             .striped(true)
                             .spacing([14.0, 5.0])
                             .show(ui, |ui| {
-                                ui.label(RichText::new("Process").color(pal.text_muted).strong());
-                                ui.label(RichText::new("PID").color(pal.text_muted).strong());
-                                ui.label(RichText::new("Estab").color(pal.text_muted).strong());
-                                ui.label(RichText::new("Listen").color(pal.text_muted).strong());
-                                ui.label(RichText::new("UDP").color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_process).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_pid).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_estab_short).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_listen_short).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_udp).color(pal.text_muted).strong());
                                 if snap.etw_active {
-                                    ui.label(RichText::new("In Speed").color(pal.emerald).strong());
-                                    ui.label(RichText::new("Out Speed").color(pal.sky).strong());
-                                    ui.label(RichText::new("Session In").color(pal.text_muted).strong());
-                                    ui.label(RichText::new("Session Out").color(pal.text_muted).strong());
+                                    ui.label(RichText::new(tr.col_in_speed).color(pal.emerald).strong());
+                                    ui.label(RichText::new(tr.col_out_speed).color(pal.sky).strong());
+                                    ui.label(RichText::new(tr.col_session_in).color(pal.text_muted).strong());
+                                    ui.label(RichText::new(tr.col_session_out).color(pal.text_muted).strong());
                                 }
-                                ui.label(RichText::new("Alerts").color(pal.text_muted).strong());
-                                ui.label(RichText::new("Executable Path").color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_alerts).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_exe_path).color(pal.text_muted).strong());
                                 ui.end_row();
 
                                 for p in rows {
@@ -1977,6 +2144,7 @@ impl NetMeterApp {
     }
 
     fn render_tab_connections(&mut self, ui: &mut egui::Ui, pal: Palette, snap: &MonitorSnapshot) {
+        let tr = self.tr();
         egui::Frame::none()
             .fill(pal.bg_alt)
             .stroke(Stroke::new(1.0_f32, pal.border))
@@ -1985,35 +2153,35 @@ impl NetMeterApp {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(RichText::new("Search:").color(pal.text_muted));
+                    ui.label(RichText::new(tr.lbl_search).color(pal.text_muted));
                     ui.text_edit_singleline(&mut self.search_query);
 
                     ui.separator();
-                    ui.selectable_value(&mut self.proto_filter, ProtoFilter::All, "All Proto");
+                    ui.selectable_value(&mut self.proto_filter, ProtoFilter::All, tr.filter_all_proto);
                     ui.selectable_value(&mut self.proto_filter, ProtoFilter::Tcp, "TCP");
                     ui.selectable_value(&mut self.proto_filter, ProtoFilter::Udp, "UDP");
 
                     ui.separator();
-                    ui.selectable_value(&mut self.state_filter, StateFilter::All, "All States");
+                    ui.selectable_value(&mut self.state_filter, StateFilter::All, tr.filter_all_states);
                     ui.selectable_value(
                         &mut self.state_filter,
                         StateFilter::Established,
-                        "Established",
+                        tr.filter_established,
                     );
                     ui.selectable_value(
                         &mut self.state_filter,
                         StateFilter::Listening,
-                        "Listening",
+                        tr.filter_listening,
                     );
                     ui.selectable_value(
                         &mut self.state_filter,
                         StateFilter::AlertsOnly,
-                        "Alerts Only",
+                        tr.filter_alerts_only,
                     );
 
                     ui.separator();
                     let mut rdns = self.control().is_rdns_enabled();
-                    if ui.checkbox(&mut rdns, "Reverse DNS").changed() {
+                    if ui.checkbox(&mut rdns, tr.chk_reverse_dns).changed() {
                         self.control().set_rdns_enabled(rdns);
                     }
                 });
@@ -2032,11 +2200,11 @@ impl NetMeterApp {
             .show(ui, |ui| {
                 ui.set_min_size(Vec2::new((full_w - 26.0).max(200.0), (full_h - 26.0).max(90.0)));
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Active Sockets & Endpoints").color(pal.text_main).strong());
+                    ui.label(RichText::new(tr.active_sockets_title).color(pal.text_main).strong());
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         theme::tag_badge(
                             ui,
-                            &format!("{} total", snap.connections.len()),
+                            &format!("{} {}", snap.connections.len(), tr.total_count),
                             pal.text_muted,
                             pal.border,
                             pal.bg_alt,
@@ -2058,14 +2226,14 @@ impl NetMeterApp {
                             .striped(true)
                             .spacing([12.0, 5.0])
                             .show(ui, |ui| {
-                                ui.label(RichText::new("Proto").color(pal.text_muted).strong());
-                                ui.label(RichText::new("Process").color(pal.text_muted).strong());
-                                ui.label(RichText::new("PID").color(pal.text_muted).strong());
-                                ui.label(RichText::new("Local Endpoint").color(pal.text_muted).strong());
-                                ui.label(RichText::new("Remote Endpoint").color(pal.text_muted).strong());
-                                ui.label(RichText::new("Host / Service").color(pal.text_muted).strong());
-                                ui.label(RichText::new("State").color(pal.text_muted).strong());
-                                ui.label(RichText::new("Triage").color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_proto).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_process).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_pid).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_local_ep).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_remote_ep).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_host_service).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_state).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_triage).color(pal.text_muted).strong());
                                 ui.end_row();
 
                                 for c in &snap.connections {
@@ -2171,7 +2339,13 @@ impl NetMeterApp {
                                                 26,
                                             );
                                             ui.horizontal(|ui| {
-                                                theme::tag_badge(ui, "! Alert", col, pal.border, tint);
+                                                theme::tag_badge(
+                                                    ui,
+                                                    tr.badge_alert_row,
+                                                    col,
+                                                    pal.border,
+                                                    tint,
+                                                );
                                             })
                                             .response
                                             .on_hover_text(&alert.reason);
@@ -2179,7 +2353,7 @@ impl NetMeterApp {
                                         None => {
                                             theme::tag_badge(
                                                 ui,
-                                                "OK",
+                                                tr.badge_ok,
                                                 pal.emerald,
                                                 pal.border_subtle,
                                                 pal.bg_alt,
@@ -2194,6 +2368,7 @@ impl NetMeterApp {
     }
 
     fn render_tab_adapters(&mut self, ui: &mut egui::Ui, pal: Palette, snap: &MonitorSnapshot) {
+        let tr = self.tr();
         egui::Frame::none()
             .fill(pal.bg_alt)
             .stroke(Stroke::new(1.0_f32, pal.border))
@@ -2202,19 +2377,16 @@ impl NetMeterApp {
             .show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.horizontal(|ui| {
-                    ui.checkbox(
-                        &mut self.show_virtual_adapters,
-                        "Show virtual / filter / down adapters",
-                    );
+                    ui.checkbox(&mut self.show_virtual_adapters, tr.chk_show_virtual);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let csv_btn = egui::Button::new("Export Connections (CSV)")
+                        let csv_btn = egui::Button::new(tr.btn_export_csv)
                             .fill(pal.surface)
                             .stroke(Stroke::new(1.0_f32, pal.border))
                             .rounding(7.0);
                         if ui.add(csv_btn).clicked() {
                             self.do_export_csv(snap);
                         }
-                        let json_btn = egui::Button::new("Export Snapshot (JSON)")
+                        let json_btn = egui::Button::new(tr.btn_export_json)
                             .fill(pal.surface)
                             .stroke(Stroke::new(1.0_f32, pal.border))
                             .rounding(7.0);
@@ -2244,25 +2416,17 @@ impl NetMeterApp {
                             .striped(true)
                             .spacing([12.0, 5.0])
                             .show(ui, |ui| {
-                                ui.label(RichText::new("Alias").color(pal.text_muted).strong());
-                                ui.label(RichText::new("Type").color(pal.text_muted).strong());
-                                ui.label(RichText::new("State").color(pal.text_muted).strong());
-                                ui.label(RichText::new("Link Speed").color(pal.text_muted).strong());
-                                ui.label(RichText::new("In Rate").color(pal.emerald).strong());
-                                ui.label(RichText::new("Out Rate").color(pal.sky).strong());
-                                ui.label(RichText::new("Total In").color(pal.text_muted).strong());
-                                ui.label(RichText::new("Total Out").color(pal.text_muted).strong());
-                                ui.label(
-                                    RichText::new("Errors (In/Out)")
-                                        .color(pal.text_muted)
-                                        .strong(),
-                                );
-                                ui.label(
-                                    RichText::new("Discards (In/Out)")
-                                        .color(pal.text_muted)
-                                        .strong(),
-                                );
-                                ui.label(RichText::new("Description").color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_alias).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_type).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_state).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_link_speed).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_in_rate).color(pal.emerald).strong());
+                                ui.label(RichText::new(tr.col_out_rate).color(pal.sky).strong());
+                                ui.label(RichText::new(tr.col_total_in).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_total_out).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_errors).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_discards).color(pal.text_muted).strong());
+                                ui.label(RichText::new(tr.col_description).color(pal.text_muted).strong());
                                 ui.end_row();
 
                                 for a in &snap.adapters {
@@ -2275,7 +2439,7 @@ impl NetMeterApp {
                                     if a.info.is_hardware {
                                         theme::tag_badge(
                                             ui,
-                                            "Physical",
+                                            tr.iface_physical,
                                             pal.sky,
                                             pal.border,
                                             pal.bg_alt,
@@ -2283,7 +2447,7 @@ impl NetMeterApp {
                                     } else {
                                         theme::tag_badge(
                                             ui,
-                                            "Virtual",
+                                            tr.iface_virtual,
                                             pal.text_muted,
                                             pal.border_subtle,
                                             pal.bg_alt,
@@ -2292,7 +2456,7 @@ impl NetMeterApp {
                                     if a.info.is_up {
                                         theme::tag_badge(
                                             ui,
-                                            "Up",
+                                            tr.state_up,
                                             pal.emerald,
                                             pal.border,
                                             pal.bg_alt,
@@ -2300,7 +2464,7 @@ impl NetMeterApp {
                                     } else {
                                         theme::tag_badge(
                                             ui,
-                                            "Down",
+                                            tr.state_down,
                                             pal.text_subtle,
                                             pal.border_subtle,
                                             pal.bg_alt,
@@ -2337,7 +2501,7 @@ impl NetMeterApp {
             .show(ui, |ui| {
                 ui.set_min_size(Vec2::new((full_w - 22.0).max(200.0), (rem_h - 22.0).max(46.0)));
                 ui.label(
-                    RichText::new("Windows IPv4 TCP Stack Health (GetTcpStatisticsEx)")
+                    RichText::new(tr.tcp_health_title)
                         .color(pal.text_main)
                         .strong(),
                 );
@@ -2376,7 +2540,7 @@ impl NetMeterApp {
                         ui.monospace(format!("OutRsts: {}", st.out_rsts));
                     });
                 } else {
-                    ui.label(RichText::new("TCP stack statistics unavailable.").color(pal.text_subtle));
+                    ui.label(RichText::new(tr.tcp_stats_unavail).color(pal.text_subtle));
                 }
             });
     }
@@ -2458,6 +2622,7 @@ impl eframe::App for NetMeterApp {
 fn main() -> eframe::Result<()> {
     let handle = start_monitor();
     let initial_theme = ThemeMode::from_pref(&install::load_theme_pref());
+    let initial_lang = Language::from_pref(&install::load_language_pref());
 
     let options = eframe::NativeOptions {
         vsync: false,
@@ -2484,6 +2649,7 @@ fn main() -> eframe::Result<()> {
             let tray = start_tray_worker(
                 Arc::clone(&handle.snapshot),
                 cc.egui_ctx.clone(),
+                initial_lang,
             );
             if !tray.has_tray {
                 let scale = cc.egui_ctx.pixels_per_point();
@@ -2507,7 +2673,12 @@ fn main() -> eframe::Result<()> {
                 cc.egui_ctx
                     .send_viewport_cmd(egui::ViewportCommand::Visible(true));
             }
-            Ok(Box::new(NetMeterApp::new(handle, tray, initial_theme)))
+            Ok(Box::new(NetMeterApp::new(
+                handle,
+                tray,
+                initial_theme,
+                initial_lang,
+            )))
         }),
     )
 }

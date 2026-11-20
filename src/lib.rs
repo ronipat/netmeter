@@ -1,4 +1,5 @@
 pub mod export;
+pub mod i18n;
 pub mod install;
 pub mod monitor;
 pub mod net;

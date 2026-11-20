@@ -2,6 +2,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 use netmeter::export;
+use netmeter::i18n::{self, Language};
 use netmeter::monitor::{format_bytes, format_link_speed, format_rate, sample_once};
 use netmeter::net::{
     adapters, all_connections, process_info, sum_hardware_up_octets, tcp_global_stats_v4,
@@ -183,4 +184,23 @@ fn snapshot_and_export_roundtrip() {
     assert!(csv_text.starts_with("timestamp,protocol,local_addr"));
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn i18n_language_selection_and_translations() {
+    assert_eq!(Language::from_pref("en"), Language::En);
+    assert_eq!(Language::from_pref("id"), Language::Id);
+    assert_eq!(Language::from_pref("Indonesia"), Language::Id);
+    assert_eq!(Language::from_pref("unknown"), Language::En);
+
+    assert_eq!(Language::En.as_pref(), "en");
+    assert_eq!(Language::Id.as_pref(), "id");
+
+    let en = i18n::strings(Language::En);
+    let id = i18n::strings(Language::Id);
+    assert_eq!(en.tab_overview, "Overview");
+    assert_eq!(id.tab_overview, "Ringkasan");
+    assert_eq!(id.tray_quit, "Keluar");
+    assert_eq!(id.btn_pause, "Jeda");
+    assert_eq!(id.btn_start, "Mulai");
 }

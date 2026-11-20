@@ -526,3 +526,11 @@ pub fn load_theme_pref() -> String {
 pub fn save_theme_pref(theme_name: &str) {
     let _ = reg_write_sz(PREFS_SUBKEY, "Theme", theme_name, false);
 }
+
+pub fn load_language_pref() -> String {
+    reg_read_string(PREFS_SUBKEY, "Language").unwrap_or_else(|| "en".into())
+}
+
+pub fn save_language_pref(lang_code: &str) {
+    let _ = reg_write_sz(PREFS_SUBKEY, "Language", lang_code, false);
+}

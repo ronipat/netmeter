@@ -15,7 +15,7 @@ A lightweight, native Windows network traffic monitoring application and CLI wri
   - **Connections**: Live IPv4/IPv6 TCP & UDP socket viewer (`GetExtendedTcpTable` / `GetExtendedUdpTable`) with search, protocol/state filters, non-blocking reverse DNS (`GetNameInfoW`), port service labels, and security triage alerts.
   - **Adapters & Diagnostics**: Physical vs. virtual/filter interface table (`GetIfTable2`, filtering `HardwareInterface` to prevent double-counting), link speeds, errors/discards, IPv4 TCP stack health (`GetTcpStatisticsEx`), and JSON/CSV export.
 
-- **3 Themes**: **Dark**, **White**, and **Cartoon** (cel-shaded comic style with orange waveform), persisted in `HKCU\Software\NetMeter\Theme`.
+- **3 Themes & 2 Languages**: **Dark**, **White**, and **Cartoon** (cel-shaded comic style with orange waveform), plus **English** and **Bahasa Indonesia**, all persisted under `HKCU\Software\NetMeter`.
 
 - **Optional Kernel ETW Throughput (`src/etw.rs`)**
   - Listens to `Microsoft-Windows-Kernel-Network` (`{7DD42A49-5329-4832-8DFD-43D979153A88}`) via `ferrisetw` when run as Administrator; gracefully degrades when run unprivileged.
